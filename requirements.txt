@@ -1,2 +1,5 @@
 streamlit
-google-genai
+google-genai==2.25.0
+pydub==0.25.1
+audioop-lts; python_version >= "3.13"
+opencc-purepy==1.3.1
