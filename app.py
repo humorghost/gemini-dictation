@@ -152,7 +152,7 @@ with st.sidebar:
     emoji_level = "中等"
     if use_emoji:
         emoji_level = st.select_slider(
-            "使用頻率", options=["少數", "中等", "大量"], value="中等"
+            "使用頻率", options=["少量", "中等", "大量"], value="中等"
         )
 
 
@@ -332,7 +332,7 @@ def transcribe_with_timestamps(client, audio_bytes, source_format, progress_bar=
 
     for i, (chunk_bytes, offset_sec) in enumerate(chunks, 1):
         if status_box:
-            status_box.info(f"🎙️ 正在辨識第 {i}/{len(chunks)} 段（約 10 分鐘/段）…")
+            status_box.info(f"🎙️ 正在辨識第 {i}/{len(chunks)} 段")
         # API 偶發 429/5xx 時做少量退避重試，不無限重試。
         last_error = None
         for attempt in range(3):
@@ -908,7 +908,7 @@ else:
 
                 emoji_instruction = ""
                 if use_emoji:
-                    if emoji_level == "少數":
+                    if emoji_level == "少量":
                         emoji_instruction = "\nEmoji 規則：請在關鍵段落或句尾適度點綴少量（1-2個）相符的 Emoji。"
                     elif emoji_level == "中等":
                         emoji_instruction = "\nEmoji 規則：請在適當的句子、情緒轉折或重點項目旁加入 Emoji。"
