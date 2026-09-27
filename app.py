@@ -7,6 +7,7 @@ import io
 import tempfile
 import time
 import json
+import hashlib
 from pathlib import Path
 from pydub import AudioSegment
 from opencc_purepy import OpenCC
@@ -72,6 +73,7 @@ with st.sidebar:
     srt_end_offset = 0.2
     srt_gap_threshold = 0.5
     subtitle_max_chars = 14
+    subtitle_main_language = "🇹🇼 中文"
 
     if task_mode == "逐字稿":
         output_mode = st.radio(
@@ -85,7 +87,14 @@ with st.sidebar:
         
         # 🎬 如果選到影視字幕，保留時間微調設定
         if output_mode == "影視字幕":
-            st.markdown("🎬 **影視字幕時間微調**")
+            st.markdown("🎬 **影視字幕設定**")
+            
+            subtitle_main_language = st.selectbox(
+                "影片主要語言",
+                ["🇹🇼 中文", "🇺🇸 英文", "🇯🇵 日文", "🇰🇷 韓文", "🌐 自動判斷"],
+                index=0,
+                help="選擇影片主要語言，協助 AI 套用較適合該語言的字幕斷句、空格與標點規則。"
+            )
             
             srt_start_offset = st.slider(
                 "起始點提早 (秒)",
@@ -160,7 +169,7 @@ with st.sidebar:
 # 音訊 / Gemini / SRT 輔助函式
 # -----------------------------
 TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
-CHUNK_MS = 10 * 60 * 1000       # 10 分鐘一段；1 小時約 6 段
+CHUNK_MS = 25 * 60 * 1000       # 25 分鐘一段；word-level timestamps 官方上限為 30 分鐘
 CHUNK_OVERLAP_MS = 1000         # 前後重疊 1 秒，降低切在字中間的風險
 MAX_SUBTITLE_CHARS = 14         # 預設單行最多字元；實際值由側欄控制
 MIN_SUBTITLE_DURATION = 0.80
@@ -194,7 +203,7 @@ def guess_mime_and_format(uploaded_name: str, is_live: bool = False):
 
 
 def split_audio_bytes(audio_bytes: bytes, source_format: str):
-    """將音訊切成約 10 分鐘 WAV，回傳 [(bytes, offset_sec), ...]。"""
+    """將音訊切成約 25 分鐘 WAV，回傳 [(bytes, offset_sec), ...]。"""
     audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=source_format)
     total_ms = len(audio)
     if total_ms <= CHUNK_MS:
@@ -370,15 +379,34 @@ def transcribe_with_timestamps(client, audio_bytes, source_format, progress_bar=
 
 
 def clean_subtitle_token(text):
-    """字幕模式移除標點與多餘空白；保留英數與中文/日文/韓文。"""
+    """字幕模式的保守清理。
+
+    中文維持舊版習慣：不把標點當成字幕內容；
+    英文／韓文／日文則保留原始標點與必要空白，避免外語字幕變成一整串。
+    最終仍由字幕校稿器做語言自然化。
+    """
     text = str(text).strip()
-    # 移除常見中英標點、全形標點及括號；不要用 \W，否則會破壞 Unicode 文字。
-    text = re.sub(r"[，。！？；：、,.!?;:：；「」『』（）()【】［］\[\]{}<>〈〉《》…—–-]+", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _has_cjk_han(text):
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+
+
+def _has_korean(text):
+    return bool(re.search(r"[\uac00-\ud7af]", text))
+
+
+def _has_latin(text):
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def _has_japanese_kana(text):
+    return bool(re.search(r"[\u3040-\u30ff]", text))
+
+
 def join_subtitle_tokens(tokens):
-    """中文不插空格；英文/數字 token 之間保留一格。"""
+    """以語言特性組合 token：中文／日文不強插空格，英文／韓文保留自然詞間空格。"""
     out = ""
     for token in tokens:
         t = clean_subtitle_token(token)
@@ -387,8 +415,15 @@ def join_subtitle_tokens(tokens):
         if not out:
             out = t
             continue
-        # 兩邊都是 ASCII 英數時插空格；中文與英文相鄰則不強插空格。
+
+        prev = out[-1:]
+        first = t[:1]
+
+        # 英文／數字 token 之間需要空格；但中英相鄰不強插。
         if re.search(r"[A-Za-z0-9]$", out) and re.match(r"^[A-Za-z0-9]", t):
+            out += " " + t
+        # 韓文 token 通常以詞為單位回傳；兩個韓文詞之間保留空格。
+        elif _has_korean(out) and _has_korean(t) and not out.endswith(" "):
             out += " " + t
         else:
             out += t
@@ -412,12 +447,33 @@ def traditionalize_text(text):
         return text
 
 
+def normalize_subtitle_punctuation(text, main_language="🇹🇼 中文"):
+    """依影片主要語言做最後的字幕標點整理；不改變文字內容本身。"""
+    result = str(text or "")
+    language = str(main_language or "")
+
+    if "中文" in language:
+        # 中文字幕維持目前簡潔風格：不主動保留中文逗號、句號、頓號。
+        result = result.replace("，", "").replace("。", "").replace("、", "")
+    elif "日文" in language:
+        # 日文影視字幕通常以換行表達停頓，保留自然語氣符號。
+        result = result.replace("、", "").replace("。", "")
+    elif "自動判斷" in language:
+        # 自動模式只在明顯有日文假名時套用日文規則，否則以中文簡潔規則為主。
+        if _has_japanese_kana(result):
+            result = result.replace("、", "").replace("。", "")
+        elif _has_cjk_han(result):
+            result = result.replace("，", "").replace("。", "").replace("、", "")
+
+    return result
+
+
 def build_candidate_groups(words, max_chars):
     """保留給舊流程使用；目前字幕斷句改由每個音訊 chunk 一次交給 Gemini 判斷。"""
     return [{"words": words, "start_sec": words[0]["start_sec"], "end_sec": words[-1]["end_sec"]}] if words else []
 
 
-def ask_gemini_for_breaks(client, words, max_chars, model):
+def ask_gemini_for_breaks(client, words, max_chars, model, main_language="中文"):
     """只讓 Gemini 決定「在哪個 token 後斷句」，不允許它改文字或時間。
 
     影視字幕以「一般影片」而非短影音為目標：在不超過使用者上限的前提下，
@@ -449,7 +505,8 @@ def ask_gemini_for_breaks(client, words, max_chars, model):
         "以下文字已由語音辨識模型取得精確的逐字時間戳；你的任務只有決定『在哪個 token 後換成下一行字幕』。\n\n"
         f"硬性上限：每行最多 {max_chars} 個字元（不計空白）。\n"
         f"建議長度：一般情況盡量落在約 {preferred_min}～{max_chars} 字；若語意完整且接近 {preferred_soft}～{max_chars} 字，優先維持同一行。\n"
-        "核心原則：寧可保留較完整、較長的一句，也不要把字幕切成短影音式的碎片。\n\n"
+        "核心原則：寧可保留較完整、較長的一句，也不要把字幕切成短影音式的碎片。\n"
+        f"影片主要語言：{main_language}。請依該語言的自然句法、詞組與字幕閱讀習慣斷句；若出現其他語言，保留其自然詞組，不要套用中文斷句規則。\n\n"
         "請嚴格遵守：\n"
         "1. 絕對不要修改、翻譯、增加或刪除任何文字。\n"
         "2. 只能在兩個 token 之間斷句，回傳 break_after 的 token index。\n"
@@ -601,12 +658,12 @@ def merge_short_subtitle_segments(segments, max_chars):
 
     return result
 
-def build_subtitle_segments(words, client=None, max_chars=14, model="gemini-3.5-flash-lite"):
+def build_subtitle_segments(words, client=None, max_chars=14, model="gemini-3.5-flash-lite", main_language="中文"):
     """以 word timestamps 為唯一時間來源；Gemini 一次判斷整個 chunk 的自然斷點。"""
     if not words:
         return []
 
-    breaks = ask_gemini_for_breaks(client, words, max_chars, model) if client is not None else []
+    breaks = ask_gemini_for_breaks(client, words, max_chars, model, main_language) if client is not None else []
     if not breaks:
         breaks = _fallback_breaks(words, max_chars)
 
@@ -643,7 +700,7 @@ def build_subtitle_segments(words, client=None, max_chars=14, model="gemini-3.5-
 
     return processed
 
-def polish_subtitle_lines(client, segments, proofreading_level, custom_rules, model):
+def polish_subtitle_lines(client, segments, proofreading_level, custom_rules, model, main_language="中文"):
     """用 Flash 做「文字」校稿，但禁止改變字幕行數與斷行；時間軸完全沿用 Python 產生的結果。"""
     if not segments:
         return segments
@@ -665,8 +722,9 @@ def polish_subtitle_lines(client, segments, proofreading_level, custom_rules, mo
         "4. 不要輸出編號、Markdown、說明文字。\n"
         "5. 保留英文產品名、型號、專有名詞的正確大小寫。\n"
         "6. 中文一律使用臺灣繁體中文；不要輸出簡體中文。\n"
-        "7. 中文字幕不要加入標點符號。\n"
-        "8. 如果不確定，保留原文，不要自行發明內容。\n"
+        "7. 中文字幕維持目前簡潔風格，不主動補標點。\n"
+        "8. 英文與韓文保留自然的詞間空格及必要標點；英文單字之間必須保留空格。\n"
+        "9. 日文字幕通常不使用「、」「。」作為主要斷句標記；若語意適合斷開，優先直接換行。若同一行內需要原本逗號般的停頓，可使用空格取代，不要任意補上「、」。保留自然的「？」「！」「…」「〜」等語氣符號；不要為了補標點而改寫原文。\n"
         f"使用者自訂規則：\n{custom_rules.strip() if custom_rules else '無'}\n\n"
         "字幕如下：\n" + numbered
     )
@@ -679,7 +737,7 @@ def polish_subtitle_lines(client, segments, proofreading_level, custom_rules, mo
         data = json.loads(response.text or "[]")
         if isinstance(data, list) and len(data) == len(segments) and all(isinstance(x, str) for x in data):
             for seg, text in zip(segments, data):
-                cleaned = clean_subtitle_token(text)
+                cleaned = re.sub(r"\s+", " ", str(text)).strip()
                 if cleaned:
                     seg["text"] = traditionalize_text(cleaned)
             return segments
@@ -723,6 +781,148 @@ def apply_simple_subtitle_rules(text, custom_rules):
         result = result.replace(old, new)
     return result
 
+
+def _v7_units_from_text(text):
+    """將文字拆成可對齊的最小單位；中文以字為單位，英文/數字也以字元比對。"""
+    return [c.lower() for c in str(text) if not c.isspace()]
+
+
+def _v7_build_char_timeline(original_words):
+    """把原始 word-level annotations 展開成字元時間軸，供重新校正使用。"""
+    timeline = []
+    for word in original_words or []:
+        text = str(word.get("text", ""))
+        chars = [c for c in text if not c.isspace()]
+        if not chars:
+            continue
+        s = float(word.get("start_sec", 0.0))
+        e = float(word.get("end_sec", s))
+        dur = max(0.001, e - s)
+        for i, ch in enumerate(chars):
+            cs = s + dur * i / len(chars)
+            ce = s + dur * (i + 1) / len(chars)
+            timeline.append({"unit": ch.lower(), "start_sec": cs, "end_sec": ce})
+    return timeline
+
+
+def _v7_remap_edited_text(edited_text, original_words, start_offset=0.0,
+                          end_offset=0.2, gap_threshold=0.5,
+                          unmatched_run_threshold=5):
+    """
+    V7：使用者可同時修改文字與斷行；重新校正時只信任第一次
+    Transcribe 保存的原始 word-level timestamps。
+    """
+    import difflib
+
+    lines = [x.strip() for x in str(edited_text).splitlines() if x.strip()]
+    timeline = _v7_build_char_timeline(original_words)
+    if not lines or not timeline:
+        return [], 0, 0, "沒有可用的原始字幕時間資料。"
+
+    original_units = [x["unit"] for x in timeline]
+    edited_units = []
+    line_ranges = []
+    pos = 0
+    for line in lines:
+        units = _v7_units_from_text(line)
+        a = pos
+        edited_units.extend(units)
+        pos += len(units)
+        line_ranges.append((a, pos, line))
+
+    matcher = difflib.SequenceMatcher(None, original_units, edited_units, autojunk=False)
+    mapping = {}
+    unknown_ranges = []
+    unmatched_count = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for oi, ej in zip(range(i1, i2), range(j1, j2)):
+                mapping[ej] = oi
+        elif tag == "replace":
+            old_len, new_len = i2 - i1, j2 - j1
+            if old_len and new_len:
+                for k in range(new_len):
+                    oi = i1 + min(
+                        old_len - 1,
+                        round(k * (old_len - 1) / max(1, new_len - 1)),
+                    )
+                    mapping[j1 + k] = oi
+        elif tag == "insert":
+            if j2 > j1:
+                unknown_ranges.append((j1, j2))
+                unmatched_count += j2 - j1
+
+    long_unknown = set()
+    for a, b in unknown_ranges:
+        if b - a >= unmatched_run_threshold:
+            long_unknown.update(range(a, b))
+
+    segments = []
+    for a, b, line in line_ranges:
+        mapped = [mapping[j] for j in range(a, b) if j in mapping]
+        if mapped:
+            s = timeline[min(mapped)]["start_sec"]
+            e = timeline[max(mapped)]["end_sec"]
+            estimated = False
+        else:
+            # 完全無法對應時，先暫用鄰近原始位置；稍後再看前後空檔。
+            anchor = min(len(timeline) - 1, max(0, a))
+            s = timeline[anchor]["start_sec"]
+            e = timeline[anchor]["end_sec"]
+            estimated = True
+
+        s = max(0.0, s - start_offset)
+        e = max(s + 0.05, e + end_offset)
+        segments.append({
+            "start_sec": s,
+            "end_sec": e,
+            "text": traditionalize_text(line),
+            "estimated": estimated,
+            "unknown_text": False,
+        })
+
+    unknown_segment_count = 0
+    for i, (a, b, line) in enumerate(line_ranges):
+        unknown_here = [j for j in range(a, b) if j in long_unknown]
+        if len(unknown_here) < unmatched_run_threshold:
+            continue
+        # 若整句只是少量修改，不把它誤判為整段漏辨識。
+        if len(unknown_here) < max(1, (b - a) * 0.5):
+            continue
+
+        unknown_segment_count += 1
+        prev_end = segments[i - 1]["end_sec"] if i > 0 else None
+        next_start = segments[i + 1]["start_sec"] if i + 1 < len(segments) else None
+
+        if prev_end is not None and next_start is not None and next_start > prev_end + 0.2:
+            segments[i]["start_sec"] = prev_end
+            segments[i]["end_sec"] = next_start
+        elif prev_end is not None:
+            segments[i]["start_sec"] = prev_end
+            segments[i]["end_sec"] = max(prev_end + 0.5, segments[i]["end_sec"])
+
+        segments[i]["estimated"] = True
+        segments[i]["unknown_text"] = True
+
+    # 保持時間軸單調、不重疊。
+    for i in range(len(segments) - 1):
+        if segments[i]["end_sec"] > segments[i + 1]["start_sec"]:
+            segments[i]["end_sec"] = segments[i + 1]["start_sec"]
+        if segments[i]["end_sec"] <= segments[i]["start_sec"]:
+            segments[i]["end_sec"] = segments[i]["start_sec"] + 0.05
+        gap = segments[i + 1]["start_sec"] - segments[i]["end_sec"]
+        if 0 <= gap < gap_threshold:
+            segments[i]["end_sec"] = segments[i + 1]["start_sec"]
+
+    return segments, unmatched_count, unknown_segment_count, None
+
+
+def _v7_line_structure_changed(old_text, new_text):
+    """只比較行數與每行文字，不把單純錯字修改視為需要再次校正。"""
+    old_lines = [x.strip() for x in str(old_text).splitlines() if x.strip()]
+    new_lines = [x.strip() for x in str(new_text).splitlines() if x.strip()]
+    return len(old_lines) != len(new_lines)
 
 def sec_to_human(sec):
     m = int(sec // 60)
@@ -781,6 +981,24 @@ else:
                 is_live_recording = False
                 st.success(f"✅ 已成功載入音訊檔：{uploaded_file.name}")
 
+        # 音檔一旦更換，清除上一個檔案的字幕、校正提示與下載狀態。
+        audio_signature = None
+        if audio_bytes is not None:
+            audio_signature = hashlib.sha256(
+                audio_bytes[:65536] + audio_bytes[-65536:] + str(len(audio_bytes)).encode() + str(audio_name).encode()
+            ).hexdigest()
+        previous_audio_signature = st.session_state.get("audio_signature")
+        if audio_signature and previous_audio_signature and audio_signature != previous_audio_signature:
+            for key in [
+                "editable_text", "editable_text_widget", "srt_data", "subtitle_words",
+                "subtitle_segments", "subtitle_original_text", "subtitle_last_calibrated_text",
+                "subtitle_confirmed_text", "subtitle_unmatched_tokens", "subtitle_unknown_segments",
+                "subtitle_download_remap_error", "match_ptr",
+            ]:
+                st.session_state.pop(key, None)
+        if audio_signature:
+            st.session_state["audio_signature"] = audio_signature
+
         sample_rules = (
             "- 影片/音檔背景與語言：本音檔為繁體中文，夾雜少量英文科技名詞。講者為台灣人，請使用台灣慣用語與在地化譯名。\n"
             "- 語氣與贅字過濾：請徹底過濾口語贅字（如：然後、呃、就是說）。\n"
@@ -790,15 +1008,25 @@ else:
         )
 
         with st.expander("🛠️ 自訂規則與詞彙表", expanded=False):
-            st.caption("在此輸入專有名詞、特定錯別字糾正規則或背景說明，AI 進行任何處理時皆會納入考量。")
+            if task_mode == "逐字稿" and output_mode == "影視字幕":
+                st.warning(
+                    "⚠️ **影視字幕提醒：** 自訂規則建議僅用於人名、地名、專有名詞或用語替換；大幅改寫文字可能影響時間校正。"
+                )
+            else:
+                st.caption("在此輸入專有名詞、特定錯別字糾正規則或背景說明，AI 進行任何處理時皆會納入考量。")
             load_sample = st.checkbox("📝 載入參考範例（勾選後自動帶入下方）", value=False)
             initial_rules_text = sample_rules if load_sample else ""
-            custom_rules_input = st.text_area(
+            if "custom_rules_input" not in st.session_state:
+                st.session_state["custom_rules_input"] = initial_rules_text
+
+            st.text_area(
                 "自訂規則內容",
-                value=initial_rules_text,
                 height=160,
-                placeholder="若有特殊專有名詞、錯別字校正或背景說明，可在此輸入..."
+                placeholder="若有特殊專有名詞、錯別字校正或背景說明，可在此輸入...",
+                key="custom_rules_input",
             )
+
+            custom_rules_input = st.session_state["custom_rules_input"]
 
         transcribe_btn = False
         if audio_bytes is not None:
@@ -807,10 +1035,41 @@ else:
 
     with col2:
         st.subheader("📝 輸出結果")
+
+        subtitle_editor_mode = False
+        if task_mode == "逐字稿" and output_mode == "影視字幕" and st.session_state.get("editable_text", ""):
+            subtitle_editor_mode = st.checkbox("🖥️ 編輯模式", value=st.session_state.get("subtitle_editor_mode", False), key="subtitle_editor_mode")
+            if subtitle_editor_mode:
+                st.markdown(
+                    """<style>
+                    textarea[aria-label="處理結果"] {
+                        min-height: 68vh !important;
+                        font-size: 18px !important;
+                        line-height: 1.75 !important;
+                    }
+                    [data-testid="stTextInput"] input {
+                        font-size: 17px !important;
+                    }
+                    </style>""",
+                    unsafe_allow_html=True,
+                )
+
         if "editable_text" not in st.session_state:
             st.session_state["editable_text"] = ""
         if "srt_data" not in st.session_state:
             st.session_state["srt_data"] = ""
+        if "subtitle_words" not in st.session_state:
+            st.session_state["subtitle_words"] = []
+        if "subtitle_segments" not in st.session_state:
+            st.session_state["subtitle_segments"] = []
+        if "subtitle_original_text" not in st.session_state:
+            st.session_state["subtitle_original_text"] = ""
+        if "subtitle_last_calibrated_text" not in st.session_state:
+            st.session_state["subtitle_last_calibrated_text"] = ""
+        if "subtitle_unmatched_tokens" not in st.session_state:
+            st.session_state["subtitle_unmatched_tokens"] = 0
+        if "subtitle_unknown_segments" not in st.session_state:
+            st.session_state["subtitle_unknown_segments"] = 0
 
         if audio_bytes is not None and transcribe_btn:
             # ---------------------------------------------------------
@@ -839,27 +1098,38 @@ else:
                             client=client,
                             max_chars=subtitle_max_chars,
                             model=selected_model,
+                            main_language=subtitle_main_language,
                         )
+                        if not segments:
+                            raise RuntimeError("已取得音訊辨識結果，但沒有成功產生字幕內容。")
                         # 先做確定性的字串修正，再讓 Flash「只校稿、不改行數」。
                         for seg in segments:
                             seg["text"] = apply_simple_subtitle_rules(seg["text"], custom_rules_input)
                         segments = polish_subtitle_lines(
-                            client, segments, proofreading_level, custom_rules_input, selected_model
+                            client, segments, proofreading_level, custom_rules_input, selected_model, subtitle_main_language
                         )
+                        # 最後做一次確定性的語言標點整理，避免 Flash 又補回中文／日文的、。
+                        for seg in segments:
+                            seg["text"] = normalize_subtitle_punctuation(seg["text"], subtitle_main_language)
 
                         srt_data = segments_to_srt(segments)
                         clean_text = "\n".join(seg["text"] for seg in segments)
                         st.session_state["editable_text"] = clean_text
+                        st.session_state["editable_text_widget"] = clean_text
                         st.session_state["srt_data"] = srt_data
+                        st.session_state["subtitle_words"] = words
+                        st.session_state["subtitle_segments"] = segments
+                        st.session_state["subtitle_original_text"] = clean_text
+                        st.session_state["subtitle_last_calibrated_text"] = clean_text
+                        st.session_state["subtitle_confirmed_text"] = clean_text
+                        st.session_state["subtitle_unmatched_tokens"] = 0
+                        st.session_state["subtitle_unknown_segments"] = 0
                         st.session_state["match_ptr"] = 0
 
                         if fallback_used:
-                            st.warning("⚠️ 某個音訊片段沒有取得 word timestamp，已使用保底文字結果；該片段時間軸可能需要人工確認。")
+                            st.warning("⚠️ 字幕已建立，但部分時間點可能需要人工確認。")
                         else:
-                            st.success(
-                                f"✅ 完成：使用 {TRANSCRIBE_MODEL}，共 {chunk_count} 段，"
-                                f"以 word-level timestamps 建立 SRT。"
-                            )
+                            st.success("✅ 已成功建立字幕檔")
                     except Exception as e:
                         st.error(f"影視字幕處理失敗：{e}")
 
@@ -929,9 +1199,13 @@ else:
                                 types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime_type),
                             ],
                         )
-                        st.session_state["editable_text"] = response.text or ""
+                        result_text = response.text or ""
+                        if not result_text.strip():
+                            raise RuntimeError("AI 沒有回傳可用的文字結果。")
+                        st.session_state["editable_text"] = result_text
                         st.session_state["srt_data"] = ""
                         st.session_state["match_ptr"] = 0
+                        st.success("✅ 已完成處理")
                     except Exception as e:
                         st.error(f"發生錯誤：{e}")
         # 尋找與取代工具
@@ -974,23 +1248,85 @@ else:
                 with b3:
                     if st.button("✨ 取代", use_container_width=True):
                         end_idx = start_idx + len(find_text)
-                        st.session_state["editable_text"] = current_text[:start_idx] + replace_text + current_text[end_idx:]
+                        new_text = current_text[:start_idx] + replace_text + current_text[end_idx:]
+                        st.session_state["editable_text"] = new_text
+                        st.session_state["editable_text_widget"] = new_text
                         st.success("已取代目前項目！")
                         st.rerun()
                 with b4:
                     if st.button("💥 全部取代", use_container_width=True):
-                        st.session_state["editable_text"] = current_text.replace(find_text, replace_text)
+                        new_text = current_text.replace(find_text, replace_text)
+                        st.session_state["editable_text"] = new_text
+                        st.session_state["editable_text_widget"] = new_text
                         st.success("已全部取代！")
                         st.rerun()
             elif find_text:
                 st.caption("找不到符合的字串")
 
-        edited_text = st.text_area(
+        if "editable_text" not in st.session_state:
+            st.session_state["editable_text"] = ""
+
+        if "editable_text_widget" not in st.session_state:
+            st.session_state["editable_text_widget"] = st.session_state["editable_text"]
+
+        st.text_area(
             "處理結果",
-            value=st.session_state["editable_text"],
             height=320,
+            key="editable_text_widget",
         )
-        st.session_state["editable_text"] = edited_text
+
+        st.session_state["editable_text"] = st.session_state["editable_text_widget"]
+
+        # 影視字幕：修改後先按「確認修改」再更新時間軸，避免下載到舊版 SRT。
+        if task_mode == "逐字稿" and output_mode == "影視字幕" and st.session_state["subtitle_words"]:
+            if "subtitle_confirmed_text" not in st.session_state:
+                st.session_state["subtitle_confirmed_text"] = st.session_state.get("subtitle_last_calibrated_text", "")
+
+            current_edited = st.session_state.get("editable_text", "")
+            confirmed_text = st.session_state.get("subtitle_confirmed_text", "")
+            subtitle_dirty = current_edited != confirmed_text
+
+            if subtitle_dirty:
+                st.session_state["subtitle_download_remap_error"] = st.session_state.get("subtitle_download_remap_error", "")
+                st.info("💡 **先修改文字與斷句，再按「確認修改」。**")
+
+            confirm_clicked = st.button(
+                "✓ 確認修改",
+                type="primary" if subtitle_dirty else "secondary",
+                use_container_width=True,
+                disabled=not subtitle_dirty,
+            )
+            if confirm_clicked:
+                remapped, unmatched, unknown_count, remap_error = _v7_remap_edited_text(
+                    current_edited,
+                    st.session_state.get("subtitle_words", []),
+                    start_offset=srt_start_offset,
+                    end_offset=srt_end_offset,
+                    gap_threshold=srt_gap_threshold,
+                    unmatched_run_threshold=5,
+                )
+                st.session_state["subtitle_download_remap_error"] = remap_error or ""
+                st.session_state["subtitle_unmatched_tokens"] = unmatched
+                st.session_state["subtitle_unknown_segments"] = unknown_count
+                if remapped:
+                    st.session_state["subtitle_segments"] = remapped
+                    st.session_state["srt_data"] = segments_to_srt(remapped)
+                st.session_state["subtitle_confirmed_text"] = current_edited
+                st.session_state["subtitle_last_calibrated_text"] = current_edited
+                st.rerun()
+
+            if not subtitle_dirty:
+                st.caption("已確認修改，可下載最新 SRT。")
+
+            remap_error = st.session_state.get("subtitle_download_remap_error", "")
+            unknown_count = st.session_state.get("subtitle_unknown_segments", 0)
+            unmatched = st.session_state.get("subtitle_unmatched_tokens", 0)
+            if remap_error:
+                st.warning("⚠️ 時間校正未能完整對應，字幕仍可下載；部分時間點可能需要手動調整。")
+            elif unknown_count:
+                st.warning("⚠️ 部分字幕無法完全對應原始時間，已暫時估算；下載後建議手動確認。")
+            elif unmatched:
+                st.info("ℹ️ 少量新增或修改文字無法完全對應原始時間，已採鄰近時間估算。")
 
         # 下載按鈕區
         if st.session_state["editable_text"]:
@@ -1007,12 +1343,14 @@ else:
                         use_container_width=True,
                     )
                 with b_col3:
+                    srt_confirmed = st.session_state.get("subtitle_confirmed_text", "") == st.session_state.get("editable_text", "")
                     st.download_button(
                         label="🎞️ 下載字幕檔 (.srt)",
                         data=st.session_state["srt_data"],
                         file_name="subtitles.srt",
                         mime="application/x-subrip",
                         use_container_width=True,
+                        disabled=not srt_confirmed,
                     )
             else:
                 b_col1, b_col2 = st.columns([1, 1])
@@ -1026,3 +1364,4 @@ else:
                         mime="text/plain",
                         use_container_width=True,
                     )
+
