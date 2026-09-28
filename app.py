@@ -1288,7 +1288,7 @@ else:
 
             if subtitle_dirty:
                 st.session_state["subtitle_download_remap_error"] = st.session_state.get("subtitle_download_remap_error", "")
-                st.info("💡 **先修改文字與斷句，再按「確認修改」。**")
+                st.info("💡 **💡 請先按「確認修改」，再下載字幕檔。**")
 
             confirm_clicked = st.button(
                 "✓ 確認修改",
