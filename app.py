@@ -1331,10 +1331,27 @@ else:
 
         # 下載按鈕區
         if st.session_state["editable_text"]:
+
+            # 判斷是否提供 Markdown 下載
+            markdown_enabled = (
+                (task_mode == "逐字稿" and output_mode == "文章段落")
+                or
+                (task_mode == "會議記錄與摘要" and output_mode in ["文章段落", "結構化大綱"])
+                or
+                (task_mode == "重點行動清單" and output_mode in [
+                    "項目符號 (Bullet points)",
+                    "數字序號 (1, 2, 3...)",
+                ])
+            )
+
+            # 影視字幕：TXT + SRT
             if task_mode == "逐字稿" and output_mode == "影視字幕" and st.session_state["srt_data"]:
+
                 b_col1, b_col2, b_col3 = st.columns([1, 1, 1])
+
                 with b_col1:
                     st.caption(f"目前字數：{len(st.session_state['editable_text'])} 字")
+
                 with b_col2:
                     st.download_button(
                         label="💾 下載純文字 (.txt)",
@@ -1343,8 +1360,13 @@ else:
                         mime="text/plain",
                         use_container_width=True,
                     )
+
                 with b_col3:
-                    srt_confirmed = st.session_state.get("subtitle_confirmed_text", "") == st.session_state.get("editable_text", "")
+                    srt_confirmed = (
+                        st.session_state.get("subtitle_confirmed_text", "")
+                        == st.session_state.get("editable_text", "")
+                    )
+
                     st.download_button(
                         label="🎞️ 下載字幕檔 (.srt)",
                         data=st.session_state["srt_data"],
@@ -1353,16 +1375,46 @@ else:
                         use_container_width=True,
                         disabled=not srt_confirmed,
                     )
+
+            # 一般模式：TXT +（視情況）Markdown
             else:
-                b_col1, b_col2 = st.columns([1, 1])
-                with b_col1:
-                    st.caption(f"目前字數：{len(st.session_state['editable_text'])} 字")
-                with b_col2:
-                    st.download_button(
-                        label="💾 下載文字檔 (.txt)",
-                        data=st.session_state["editable_text"],
-                        file_name="ai_transcript_result.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
+
+                if markdown_enabled:
+                    b_col1, b_col2, b_col3 = st.columns([1, 1, 1])
+
+                    with b_col1:
+                        st.caption(f"目前字數：{len(st.session_state['editable_text'])} 字")
+
+                    with b_col2:
+                        st.download_button(
+                            label="💾 下載 TXT",
+                            data=st.session_state["editable_text"],
+                            file_name="ai_transcript_result.txt",
+                            mime="text/plain",
+                            use_container_width=True,
+                        )
+
+                    with b_col3:
+                        st.download_button(
+                            label="💾 下載 Markdown (.md)",
+                            data=st.session_state["editable_text"],
+                            file_name="ai_transcript_result.md",
+                            mime="text/markdown",
+                            use_container_width=True,
+                        )
+
+                else:
+                    b_col1, b_col2 = st.columns([1, 1])
+
+                    with b_col1:
+                        st.caption(f"目前字數：{len(st.session_state['editable_text'])} 字")
+
+                    with b_col2:
+                        st.download_button(
+                            label="💾 下載 TXT",
+                            data=st.session_state["editable_text"],
+                            file_name="ai_transcript_result.txt",
+                            mime="text/plain",
+                            use_container_width=True,
+                        )
 
