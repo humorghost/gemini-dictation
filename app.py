@@ -1203,6 +1203,7 @@ else:
                         if not result_text.strip():
                             raise RuntimeError("AI 沒有回傳可用的文字結果。")
                         st.session_state["editable_text"] = result_text
+                        st.session_state["editable_text_widget"] = result_text
                         st.session_state["srt_data"] = ""
                         st.session_state["match_ptr"] = 0
                         st.success("✅ 已完成處理")
