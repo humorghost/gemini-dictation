@@ -46,14 +46,6 @@ with st.sidebar:
         placeholder="請輸入你的 API Key"
     )
 
-    # 選擇模型（預設為 gemini-3.5-flash-lite，改為整體性提示）
-    selected_model = st.selectbox(
-        "選擇 Gemini 模型",
-        ["gemini-3.5-flash-lite", "gemini-3.5-flash"],
-        index=0,
-        help="flash-lite 模型速度較快且時間點較準，flash 模型理解與綜合表現較好。"
-    )
-
     st.markdown("---")
     st.header("🧠 處理模式")
     task_mode = st.selectbox(
@@ -168,6 +160,7 @@ with st.sidebar:
 # -----------------------------
 # 音訊 / Gemini / SRT 輔助函式
 # -----------------------------
+FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 CHUNK_MS = 25 * 60 * 1000       # 25 分鐘一段；word-level timestamps 官方上限為 30 分鐘
 CHUNK_OVERLAP_MS = 1000         # 前後重疊 1 秒，降低切在字中間的風險
@@ -542,7 +535,7 @@ def ask_gemini_for_breaks(client, words, max_chars, model, main_language="中文
     }
     try:
         response = client.models.generate_content(
-            model=model,
+            model=FLASH_LITE_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -730,7 +723,7 @@ def polish_subtitle_lines(client, segments, proofreading_level, custom_rules, mo
     )
     try:
         response = client.models.generate_content(
-            model=model,
+            model=FLASH_LITE_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
@@ -1097,7 +1090,7 @@ else:
                             words,
                             client=client,
                             max_chars=subtitle_max_chars,
-                            model=selected_model,
+                            model=FLASH_LITE_MODEL,
                             main_language=subtitle_main_language,
                         )
                         if not segments:
@@ -1106,7 +1099,7 @@ else:
                         for seg in segments:
                             seg["text"] = apply_simple_subtitle_rules(seg["text"], custom_rules_input)
                         segments = polish_subtitle_lines(
-                            client, segments, proofreading_level, custom_rules_input, selected_model, subtitle_main_language
+                            client, segments, proofreading_level, custom_rules_input, FLASH_LITE_MODEL, subtitle_main_language
                         )
                         # 最後做一次確定性的語言標點整理，避免 Flash 又補回中文／日文的、。
                         for seg in segments:
@@ -1193,7 +1186,7 @@ else:
                 with st.spinner("🎧 AI 處理中..."):
                     try:
                         response = client.models.generate_content(
-                            model=selected_model,
+                            model=FLASH_LITE_MODEL,
                             contents=[
                                 final_prompt,
                                 types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime_type),
