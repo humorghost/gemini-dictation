@@ -167,7 +167,8 @@ CHUNK_OVERLAP_MS = 1000         # 前後重疊 1 秒，降低切在字中間的�
 MAX_SUBTITLE_CHARS = 14         # 預設單行最多字元；實際值由側欄控制
 MIN_SUBTITLE_DURATION = 0.80
 MAX_SUBTITLE_DURATION = 4.00
-BREAK_GAP_SEC = 0.30  # 短暫自然停頓也應納入影視字幕斷行判斷
+BREAK_GAP_SEC = 0.30  # 備援流程使用的停頓參考值
+PAUSE_BREAK_SEC = 0.25  # 影視字幕積極考慮的自然短停頓
 
 # OpenCC：將 Transcribe 的簡體中文轉成臺灣常用繁體，且不碰時間戳
 try:
@@ -494,7 +495,7 @@ def ask_gemini_for_breaks(client, words, max_chars, model, main_language="中文
         "斷行判斷原則，請依重要性綜合考量：\n"
         "1. 說話者的自然停頓是非常重要的斷行訊號。<gap_before> 表示該 token 開始前的實際停頓秒數。\n"
         "2. 約 0.5 秒或更長的停頓，通常應在停頓前斷行；除非前一段短得不適合獨立成行，或斷開會拆散不可分的固定詞組。\n"
-        "3. 約 0.3～0.5 秒的短暫停頓，也要積極考慮斷行，尤其前面已形成一段自然、足以閱讀的字幕時。不要再把短暫停頓一律當成不重要。\n"
+        "3. 約 0.25～0.5 秒的短暫停頓，也要積極考慮斷行，尤其前面已形成一段自然、足以閱讀的字幕時。不要再把短暫停頓一律當成不重要。\n"
         "4. 即使前後仍是同一句話，也可以在自然停頓處換行；不必等到完整句子或完整子句結束。影視字幕的說話節奏通常比書面文章的完整句型更重要。\n"
         "5. 但不是每個停頓都必須斷行。如果前後語意非常緊密、停頓很輕微，或斷開會留下不自然的短片段，可以保持同一行。\n"
         "6. 使用者設定的字數是長度參考。沒有自然停頓時，盡量在接近此長度的自然語意位置斷行；若句子完整且閱讀流暢，可以略微超過，不要為了數字硬切。\n"
@@ -534,9 +535,10 @@ def ask_gemini_for_breaks(client, words, max_chars, model, main_language="中文
 
 
 def add_pause_based_breaks(words, breaks, max_chars):
-    """補入有足夠閱讀內容的自然停頓斷點；不改文字，也不改任何 token 時間。
+    """把自然停頓補進斷點；只在原始 token 邊界斷開，不改任何時間戳。
 
-    0.5 秒以上視為強停頓；0.3～0.5 秒則依停頓前累積的字幕長度判斷。
+    約 0.5 秒以上是強停頓；0.25～0.5 秒也積極考慮。
+    為避免碎片，停頓前至少要有 4 個可閱讀字元（或一個完整 token）。
     """
     break_set = set(breaks or [])
     current_tokens = []
@@ -549,17 +551,15 @@ def add_pause_based_breaks(words, breaks, max_chars):
             continue
 
         if previous_index is not None:
-            # Gemini 已選擇的斷點先重設目前累積長度，避免重複計算前一行。
             if previous_index in break_set:
                 current_tokens = []
-            gap = max(0.0, word["start_sec"] - previous_end)
+            gap = max(0.0, float(word["start_sec"]) - float(previous_end))
             current_len = _subtitle_text_len(join_subtitle_tokens(current_tokens))
+            min_readable = min(4, max(2, int(round(max_chars * 0.25))))
 
-            strong_pause = gap >= 0.50 and current_len >= 4
-            short_pause = (
-                BREAK_GAP_SEC <= gap < 0.50
-                and current_len >= max(4, int(round(max_chars * 0.45)))
-            )
+            # 明顯停頓不應被「完整句子」規則壓掉；較短停頓也納入考慮。
+            strong_pause = gap >= 0.50 and current_len >= min_readable
+            short_pause = PAUSE_BREAK_SEC <= gap < 0.50 and current_len >= min_readable
             if strong_pause or short_pause:
                 break_set.add(previous_index)
                 current_tokens = []
@@ -567,6 +567,75 @@ def add_pause_based_breaks(words, breaks, max_chars):
         current_tokens.append(token)
         previous_index = index
         previous_end = word["end_sec"]
+
+    return sorted(i for i in break_set if 0 <= i < len(words) - 1)
+
+
+def add_length_reference_breaks(words, breaks, max_chars):
+    """對明顯過長的字幕補上 token 邊界斷點；字數是參考值，不作逐字硬切。
+
+    只有目前一行超過參考值一段幅度時才強制尋找額外斷點；優先選擇
+    接近參考字數、停頓較長、標點後的位置。絕不拆開單一 token。
+    """
+    if not words or max_chars <= 0:
+        return sorted(set(breaks or []))
+
+    break_set = set(breaks or [])
+    # 容許略長以保留語意；但超過這個幅度就必須在 token 邊界尋找拆分點。
+    overlong_threshold = max(max_chars + 4, int(round(max_chars * 1.25)))
+    min_side = min(4, max(2, int(round(max_chars * 0.25))))
+
+    def token_len(word):
+        return _subtitle_text_len(clean_subtitle_token(word.get("text", "")))
+
+    # 逐一處理現有字幕段落；新增斷點後，段落仍只由原始 token 組成。
+    segment_start = 0
+    boundaries = sorted(i for i in break_set if 0 <= i < len(words) - 1) + [len(words) - 1]
+    for segment_end in boundaries:
+        indices = [i for i in range(segment_start, segment_end + 1)
+                   if clean_subtitle_token(words[i].get("text", ""))]
+        if len(indices) >= 2:
+            while True:
+                total_len = sum(token_len(words[i]) for i in indices)
+                if total_len <= overlong_threshold:
+                    break
+
+                candidates = []
+                running = 0
+                for pos, idx in enumerate(indices[:-1]):
+                    running += token_len(words[idx])
+                    right_len = total_len - running
+                    if running < min_side or right_len < min_side:
+                        continue
+                    next_idx = indices[pos + 1]
+                    gap = max(0.0, float(words[next_idx]["start_sec"]) - float(words[idx]["end_sec"]))
+                    token_text = clean_subtitle_token(words[idx].get("text", ""))
+                    punctuation_bonus = 1.5 if re.search(r"[，。！？；：、,.!?;:]$", token_text) else 0.0
+                    pause_bonus = min(gap, 0.8) * 5.0
+                    # 越接近使用者設定值越好；停頓與標點提供額外優先權。
+                    score = abs(running - max_chars) - pause_bonus - punctuation_bonus
+                    candidates.append((score, idx, running, gap))
+
+                if not candidates:
+                    break
+                _, split_after, _, _ = min(candidates, key=lambda item: item[0])
+                if split_after in break_set:
+                    break
+                break_set.add(split_after)
+                indices = [i for i in indices if i <= split_after] + [i for i in indices if i > split_after]
+                # 只處理剛拆出的左段；右段由下一輪重新掃描邊界。
+                left_indices = [i for i in indices if i <= split_after]
+                right_indices = [i for i in indices if i > split_after]
+                left_len = sum(token_len(words[i]) for i in left_indices)
+                if left_len <= overlong_threshold:
+                    # 若右段仍過長，將它繼續拆；否則結束本段。
+                    if sum(token_len(words[i]) for i in right_indices) <= overlong_threshold:
+                        break
+                    indices = right_indices
+                else:
+                    indices = left_indices
+
+        segment_start = segment_end + 1
 
     return sorted(i for i in break_set if 0 <= i < len(words) - 1)
 
@@ -649,7 +718,7 @@ def merge_short_subtitle_segments(segments, max_chars):
         if (
             cur_len <= very_short
             and combined_len <= max_chars
-            and gap < BREAK_GAP_SEC
+            and gap < PAUSE_BREAK_SEC
             and prev_len > 0
         ):
             prev["text"] = join_subtitle_tokens([prev["text"], cur["text"]])
@@ -661,7 +730,7 @@ def merge_short_subtitle_segments(segments, max_chars):
         if (
             prev_len <= very_short
             and combined_len <= max_chars
-            and gap < BREAK_GAP_SEC
+            and gap < PAUSE_BREAK_SEC
         ):
             prev["text"] = join_subtitle_tokens([prev["text"], cur["text"]])
             prev["end_sec"] = cur["end_sec"]
@@ -682,16 +751,17 @@ def build_subtitle_segments(words, client=None, max_chars=14, model="gemini-3.5-
     if not breaks:
         breaks = _fallback_breaks(words, max_chars)
 
-    # 無論 Gemini 是否成功，都把明顯的自然停頓納入斷行；短行合併也不得吞掉這些停頓。
+    # 無論 Gemini 是否成功，都重新檢查自然停頓；接著對明顯超長行補上 token 邊界斷點。
     breaks = add_pause_based_breaks(words, breaks, max_chars)
+    breaks = add_length_reference_breaks(words, breaks, max_chars)
     segments = build_segments_from_breaks(words, breaks)
-    # Gemini 斷得過碎時，用非常保守的規則收回極短字幕行；不改變 word timestamp。
+    # 只合併幾乎沒有停頓的極短碎片，不能吞掉自然停頓。
     segments = merge_short_subtitle_segments(segments, max_chars)
     if not segments:
         text = join_subtitle_tokens([w["text"] for w in words])
         segments = [{"start_sec": words[0]["start_sec"], "end_sec": words[-1]["end_sec"], "text": text}]
 
-    # 標記明顯超出使用者參考長度的行，供後續檢視；不在 token 或詞組中間硬切。
+    # 標記仍超出參考長度的行（例如單一 token 本身過長或沒有安全 token 邊界）；不硬切 token。
     for seg in segments:
         if _subtitle_text_len(seg["text"]) > max_chars:
             seg["over_limit"] = True
